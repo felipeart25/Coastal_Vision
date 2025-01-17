@@ -1,6 +1,15 @@
-site_name: Coastal Vision Documentation
+site_name: 'Coastal Vision Documentation'
 theme:
-  name: material
+  name: 'material'
+  language: 'en'
+  icon:
+    logo: material/music-clef-treble
+  palette:
+    primary: 'black'
+    accent: 'deep orange'
+  font:
+    text: 'Roboto'
+    code: 'JetBrains Mono'
 
 nav:
-  - Home: index.md
+  - 'Home': index.md
