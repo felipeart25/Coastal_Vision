@@ -1,0 +1,102 @@
+site_name: Coastal Vision Documentation
+site_url: https://felipeart25.github.io/Coastal_Vision/
+site_author: Daniel Arteaga
+site_description: >-
+  This is a documentation site for Coastal Vision, a project that aims to provide a platform for the visualization of coastal data.
+
+# Repository
+repo_name: Coastal_Vision
+repo_url: https://github.com/felipeart25/Coastal_Vision/
+
+
+# Configuration 
+theme:
+  name: material
+  custom_dir: docs/overrides
+
+  font:
+    text: Roboto
+    code: Red Hat Mono
+  #icon:
+  #  logo: fontawesome/solid/web-awesome
+  logo: assets/Logo1.png
+  features:
+    - navigation.footer
+    - navigation.tabs
+    - navigation.indexes
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - search.share
+    - search.suggest
+    - content.code.copy
+    - content.code.select
+    - content.footnote.tooltips
+    - content.tabs.link
+    - content.tooltips
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.progress
+    - navigation.tabs.sticky
+    - header.autohide
+
+  palette:
+    # Dark theme
+    - scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Dark mode
+      primary: black
+      accent: deep purple
+
+    # Light theme
+    - scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Light mode
+      primary: black
+      accent: pink
+
+extra_css:
+  - overrides/custom.css
+
+nav:
+  - Home: index.md
+  - Documentation: 
+      - documentation/index.md
+      - Code Example: documentation/codeexample.md
+      - Content: documentation/content-tabs.md
+      - Admonitions: documentation/admonitions.md
+      - Diagram: documentation/diagram_exmaples.md
+
+markdown_extensions:
+  - attr_list
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+      combine_header_slug: true
+  - admonition
+  - pymdownx.details
+  - md_in_html
+
+extra:
+  social:
+    - icon: simple/github
+      link: https://github.com/felipeart25
+
+copyright: Copyright &copy; 2025 Daniel Arteaga
+
+
