@@ -1,11 +1,9 @@
+---
+template: home.html
+title: Material for MkDocs
+social:
+  cards_layout_options:
+    title: Documentation that simply works
+---
 
-
-## Project layout
-
-    mkdocs.yml
-    docs/
-        index.md
-        codeexample.md
-        content-tabs.md
-
-I like to drink :beers:
+Welcome to Material for MkDocs.
