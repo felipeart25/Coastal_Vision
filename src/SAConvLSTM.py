@@ -6,20 +6,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import wandb
+import random
 import os
 
-print('hola')
-# Initialize WandB
 wandb.login(key="d42992a374fbc96ee65d1955f037e71d58e30f45")
-run = wandb.init(project="convlstm-mnist",
-    name=f"run-{wandb.util.generate_id()}",
-    config={
+
+# Initialize WandB
+wandb.init(project="convlstm-mnist", 
+           name=f"run-{wandb.util.generate_id()}",
+           config={
     "input_dim": 1,
     "hidden_dim": 64,
     "kernel_size": (3, 3),
     "num_layers": 2,
     "batch_size": 8,
-    "epochs": 150,
+    "epochs": 3,
     "learning_rate": 0.001,
     "optimizer": "Adam",
     "loss_function": "MSELoss"
@@ -81,245 +82,173 @@ for inputs, targets in test_loader:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
 
-class ConvLSTMCell(nn.Module):
-    """
-    Basic ConvLSTM cell.
-    """
-    def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
-        """
-        Initialize ConvLSTM cell.
+class SAM(nn.Module):
+    """Self-Attention Memory Module"""
+    def __init__(self, in_channels):
+        super().__init__()
+        self.query = nn.Conv2d(in_channels, in_channels//8, 1)
+        self.key = nn.Conv2d(in_channels, in_channels//8, 1)
+        self.value = nn.Conv2d(in_channels, in_channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
         
-        Parameters:
-        ----------
-        input_dim: int
-            Number of channels of input tensor.
-        hidden_dim: int
-            Number of channels of hidden state.
-        kernel_size: int
-            Size of the convolutional kernel.
-        bias: bool
-            Whether to add bias or not.
-        """
-        super(ConvLSTMCell, self).__init__()
+    def forward(self, x, prev_memory):
+        batch_size, _, height, width = x.size()
         
+        # Query, Key, Value projections
+        q = self.query(x).view(batch_size, -1, height*width).permute(0, 2, 1)  # [B, N, C']
+        k = self.key(x).view(batch_size, -1, height*width)  # [B, C', N]
+        v = self.value(x).view(batch_size, -1, height*width)  # [B, C, N]
+        
+        # Memory integration
+        if prev_memory is not None:
+            k_m = self.key(prev_memory).view(batch_size, -1, height*width)
+            v_m = self.value(prev_memory).view(batch_size, -1, height*width)
+            k = torch.cat([k, k_m], dim=2)
+            v = torch.cat([v, v_m], dim=2)
+        
+        # Attention weights
+        attention = torch.bmm(q, k)  # [B, N, N]
+        attention = F.softmax(attention, dim=-1)
+        
+        # Attend to values
+        out = torch.bmm(v, attention.permute(0, 2, 1))
+        out = out.view(batch_size, -1, height, width)
+        
+        # Update memory
+        new_memory = self.gamma * out + x
+        
+        return out + x, new_memory  # Residual connection
+
+class SAConvLSTMCell(nn.Module):
+    """Self-Attention ConvLSTM Cell"""
+    def __init__(self, input_dim, hidden_dim, kernel_size):
+        super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.kernel_size = kernel_size
-        self.padding = kernel_size[0] // 2, kernel_size[1] // 2
-        self.bias = bias
+        padding = kernel_size[0] // 2, kernel_size[1] // 2
         
         self.conv = nn.Conv2d(
-            in_channels=self.input_dim + self.hidden_dim,
-            out_channels=4 * self.hidden_dim,  # For the four gates
-            kernel_size=self.kernel_size,
-            padding=self.padding,
-            bias=self.bias
+            in_channels=input_dim + hidden_dim,
+            out_channels=4 * hidden_dim,
+            kernel_size=kernel_size,
+            padding=padding
         )
+        self.sam = SAM(hidden_dim)
         
-    def forward(self, input_tensor, cur_state):
-        """
-        Forward propagation.
+    def forward(self, x, prev_state):
+        h_prev, c_prev, m_prev = prev_state
         
-        Parameters:
-        ----------
-        input_tensor: 4D tensor
-            Input tensor of shape (batch_size, input_dim, height, width)
-        cur_state: tuple
-            Current hidden and cell states (h_cur, c_cur)
-            
-        Returns:
-        -------
-        h_next, c_next: next hidden and cell states
-        """
-        h_cur, c_cur = cur_state
-        
-        # Concatenate along channel axis
-        combined = torch.cat([input_tensor, h_cur], dim=1)
-        
-        # Convolutional operation
+        # ConvLSTM operations
+        combined = torch.cat([x, h_prev], dim=1)
         combined_conv = self.conv(combined)
-        
-        # Split the combined output into the 4 gates
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
         
-        # Apply gate activations
-        i = torch.sigmoid(cc_i)  # input gate
-        f = torch.sigmoid(cc_f)  # forget gate
-        o = torch.sigmoid(cc_o)  # output gate
-        g = torch.tanh(cc_g)     # cell gate
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
         
-        # Update cell state and hidden state
-        c_next = f * c_cur + i * g
-        h_next = o * torch.tanh(c_next)
+        c_cur = f * c_prev + i * g
+        h_cur = o * torch.tanh(c_cur)
         
-        return h_next, c_next
+        # Self-attention memory
+        h_attn, m_cur = self.sam(h_cur, m_prev)
+        
+        # Store h_attn in the state instead of h_cur
+        return h_attn, (h_attn, c_cur, m_cur)  # Changed h_cur to h_attn
 
-class ConvLSTM(nn.Module):
-    """
-    ConvLSTM module for sequence prediction.
-    """
-    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, batch_first=True, bias=True):
-        """
-        Initialize ConvLSTM.
-        
-        Parameters:
-        ----------
-        input_dim: int
-            Number of channels in input
-        hidden_dim: int
-            Number of hidden channels
-        kernel_size: int
-            Size of kernel in convolutions
-        num_layers: int
-            Number of LSTM layers stacked on each other
-        batch_first: bool
-            If True, dimension 0 is batch, dimension 1 is time, dimension 2 is channel.
-            If False, dimension 0 is time, dimension 1 is batch, dimension 2 is channel.
-        bias: bool
-            Whether to add bias or not
-        """
-        super(ConvLSTM, self).__init__()
-        
+class SimpleSAConvLSTM(nn.Module):
+    """Simplified SA-ConvLSTM without separate encoder and decoder"""
+    def __init__(self, input_dim=1, hidden_dim=64, num_layers=4, kernel_size=3):
+        super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.kernel_size = kernel_size
         self.num_layers = num_layers
-        self.batch_first = batch_first
-        self.bias = bias
         
-        # Create a list of ConvLSTM cells
-        cell_list = []
-        for i in range(self.num_layers):
-            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim
-            cell_list.append(ConvLSTMCell(cur_input_dim, self.hidden_dim, self.kernel_size, self.bias))
+        # Create stack of SAConvLSTM cells
+        self.cells = nn.ModuleList()
+        for i in range(num_layers):
+            if i == 0:
+                cell_input_dim = input_dim
+            else:
+                cell_input_dim = hidden_dim
+                
+            self.cells.append(SAConvLSTMCell(cell_input_dim, hidden_dim, kernel_size))
         
-        self.cell_list = nn.ModuleList(cell_list)
+        # Output layer
+        self.conv_out = nn.Conv2d(hidden_dim, input_dim, kernel_size=1)
         
-    def _init_hidden(self, batch_size, image_size):
-        """
-        Initialize hidden state.
-        
-        Parameters:
-        ----------
-        batch_size: int
-            Size of the batch
-        image_size: tuple
-            Height and width of the feature maps
-            
-        Returns:
-        -------
-        init_states: list
-            List of tuples (h, c) for each layer
-        """
-        height, width = image_size
-        init_states = []
-        for i in range(self.num_layers):
-            h = torch.zeros(batch_size, self.hidden_dim, height, width, device=self.cell_list[0].conv.weight.device)
-            c = torch.zeros(batch_size, self.hidden_dim, height, width, device=self.cell_list[0].conv.weight.device)
-            init_states.append((h, c))
-        return init_states
+    def init_hidden(self, batch_size, height, width, device):
+        """Initialize hidden states for all layers"""
+        hidden = []
+        for _ in range(self.num_layers):
+            h = torch.zeros(batch_size, self.hidden_dim, height, width, device=device)
+            c = torch.zeros(batch_size, self.hidden_dim, height, width, device=device)
+            m = torch.zeros(batch_size, self.hidden_dim, height, width, device=device)
+            hidden.append((h, c, m))
+        return hidden
     
-    def forward(self, input_tensor, hidden_state=None):
+    def forward(self, x, future_seq=10):
         """
-        Forward pass through ConvLSTM layers.
-        
-        Parameters:
-        ----------
-        input_tensor: 5D tensor
-            Input of shape (batch_size, time, channels, height, width) if batch_first
-            or (time, batch_size, channels, height, width) otherwise
-        hidden_state: list of tuples
-            List of tuples (h, c) for each layer
-            
-        Returns:
-        -------
-        layer_output_list: list
-            List of outputs from each layer
-        last_state_list: list
-            List of final states from each layer
+        x: input tensor of shape [batch_size, seq_len, channels, height, width]
+        future_seq: number of future frames to predict
         """
-        # Make sure we're working with batch first format
-        if not self.batch_first:
-            # (t, b, c, h, w) -> (b, t, c, h, w)
-            input_tensor = input_tensor.permute(1, 0, 2, 3, 4)
-            
-        # Get dimensions
-        batch_size, seq_len, _, height, width = input_tensor.size()
+        # Get tensor dimensions
+        batch_size, seq_len, _, height, width = x.size()
+        device = x.device
         
-        # Initialize hidden states if none provided
-        if hidden_state is None:
-            hidden_state = self._init_hidden(batch_size, (height, width))
-            
-        layer_output_list = []
-        last_state_list = []
+        # Initialize hidden states for all layers
+        hidden = self.init_hidden(batch_size, height, width, device)
         
-        # Process each sequence element
-        for layer_idx in range(self.num_layers):
-            h, c = hidden_state[layer_idx]
-            output_inner = []
-            
-            for t in range(seq_len):
-                # Get input for this timestep
+        # Process input sequence
+        for t in range(seq_len):
+            input_tensor = x[:, t]
+            for layer_idx, cell in enumerate(self.cells):
                 if layer_idx == 0:
-                    # For the first layer, input comes from the original input sequence
-                    x = input_tensor[:, t, :, :, :]
+                    # First layer takes the input directly
+                    h, hidden[layer_idx] = cell(input_tensor, hidden[layer_idx])
                 else:
-                    # For subsequent layers, input comes from the output of the previous layer
-                    x = layer_output_list[layer_idx-1][:, t, :, :, :]
-                    
-                # Process through the ConvLSTM cell
-                h, c = self.cell_list[layer_idx](x, (h, c))
-                
-                # Store output
-                output_inner.append(h)
-                
-            # Stack outputs along time dimension
-            layer_output = torch.stack(output_inner, dim=1)
-            layer_output_list.append(layer_output)
-            last_state_list.append((h, c))
-            
-        # Return outputs as needed
-        return layer_output_list[-1], last_state_list
+                    # Higher layers take output from previous layer
+                    h, hidden[layer_idx] = cell(h, hidden[layer_idx])
+        
+        # Generate future predictions
+        outputs = []
+        for _ in range(future_seq):
+            for layer_idx, cell in enumerate(self.cells):
+                if layer_idx == 0:
+                    if len(outputs) == 0:
+                        # Use the last layer's output (h_attn) from input processing
+                        last_output = hidden[-1][0]  # Now h_attn is stored in the state
+                        first_pred = self.conv_out(last_output)
+                        h, hidden[layer_idx] = cell(first_pred, hidden[layer_idx])
+                    else:
+                        h, hidden[layer_idx] = cell(outputs[-1][:, 0], hidden[layer_idx])
+                else:
+                    h, hidden[layer_idx] = cell(h, hidden[layer_idx])
+            # Generate prediction from the last layer's output (h_attn)
+            pred = self.conv_out(hidden[-1][0])
+            outputs.append(pred.unsqueeze(1))
+        
+        # Concatenate all predictions along time dimension
+        outputs = torch.cat(outputs, dim=1)
+        return outputs
+
 
 class Predictor(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size, num_layers):
         super(Predictor, self).__init__()
-        
-        self.convlstm = ConvLSTM(input_dim=input_dim,
-                                hidden_dim=hidden_dim,
-                                kernel_size=kernel_size,
-                                num_layers=num_layers)
-        self.conv_output = nn.Conv2d(hidden_dim, input_dim, kernel_size=1)
-
+        # Use the new SAConvLSTM implementation
+        self.saconvlstm = SimpleSAConvLSTM(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            kernel_size=kernel_size
+        )
+    
     def forward(self, x, future_seq=10):
-        # Process input sequence
-        _, lstm_states = self.convlstm(x)
-        
-        # Generate future predictions
-        current_input = x[:, -1]  # Last input frame
-        outputs = []
-        
-        hidden_state = lstm_states
-        
-        for _ in range(future_seq):
-            # Reshape for input to ConvLSTM cell
-            current_input = current_input.unsqueeze(1)  # Add time dimension
-            
-            # Forward pass through ConvLSTM
-            lstm_output, hidden_state = self.convlstm(current_input, hidden_state)
-            
-            # Generate prediction
-            current_input = self.conv_output(lstm_output[:, 0])
-            
-            # Store prediction
-            outputs.append(current_input.unsqueeze(1))
-        
-        # Concatenate all predictions
-        outputs = torch.cat(outputs, dim=1)
-        
-        return outputs
+        # Directly return predictions from SAConvLSTM
+        return self.saconvlstm(x, future_seq=future_seq)
     
 def train(model, train_loader, criterion, optimizer, device, epoch):
     model.train()
@@ -329,7 +258,7 @@ def train(model, train_loader, criterion, optimizer, device, epoch):
 
         optimizer.zero_grad()
         output = model(input_seq)
-
+        #print(future_seq.shape, output.shape )
         loss = criterion(output, future_seq)
         loss.backward()
         optimizer.step()
@@ -453,13 +382,8 @@ def main():
         val_losses.append(val_loss)
 
     # Save model
-    model_path = "convlstm_mnist.pth"
-    torch.save(model.state_dict(), model_path)
-    artifact = wandb.Artifact(name="Conv-LSTM", type="model")
-    artifact.add_file(model_path)
-    wandb.log_artifact(artifact)  # Log model checkpoint to WandB
-
-
+    torch.save(model.state_dict(), 'convlstm_mnist.pth')
+    wandb.save('convlstm_mnist.pth')  # Log model checkpoint to WandB
     
     # Visualize predictions
     visualize_prediction(model, test_loader, device)
@@ -483,3 +407,5 @@ def main():
 
 if __name__ == '__main__':
     model = main()
+
+
