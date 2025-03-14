@@ -7,19 +7,21 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import wandb
 import os
+import torch.nn.functional as F
+import random
+import math
 
-print('hola')
 # Initialize WandB
 wandb.login(key="d42992a374fbc96ee65d1955f037e71d58e30f45")
-run = wandb.init(project="convlstm-mnist",
+wandb.init(project="convlstm-mnist",
     name=f"run-{wandb.util.generate_id()}",
     config={
     "input_dim": 1,
     "hidden_dim": 64,
     "kernel_size": (3, 3),
-    "num_layers": 2,
+    "num_layers": 4,
     "batch_size": 8,
-    "epochs": 150,
+    "epochs": 10,
     "learning_rate": 0.001,
     "optimizer": "Adam",
     "loss_function": "MSELoss"
@@ -78,30 +80,44 @@ for inputs, targets in test_loader:
     break
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import random
+class SelfAttentionModule(nn.Module):
+    """ Standard self-attention module for spatial attention in ConvLSTM """
+    def __init__(self, in_channels):
+        super().__init__()
+        self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))  # Learnable scale parameter
+    
+    def forward(self, x):
+        """
+        x: Hidden state tensor (batch_size, C, H, W)
+        """
+        batch_size, C, H, W = x.shape
+        N = H * W  # Flatten spatial dimensions
 
-class ConvLSTMCell(nn.Module):
+        # Compute Query, Key, and Value
+        q = self.query(x).view(batch_size, -1, N).permute(0, 2, 1)  # (B, N, C')
+        k = self.key(x).view(batch_size, -1, N)  # (B, C', N)
+        v = self.value(x).view(batch_size, -1, N)  # (B, C, N)
+
+        # Compute attention weights
+        attention = torch.bmm(q, k)  # (B, N, N)
+        attention = F.softmax(attention, dim=-1)
+
+        # Compute attended values
+        attended_values = torch.bmm(v, attention.permute(0, 2, 1))
+        attended_values = attended_values.view(batch_size, C, H, W)
+
+        # Apply residual connection with scaling
+        out = self.gamma * attended_values + x  # (B, C, H, W)
+
+        return out
+
+ """
+    ConvLSTM cell with spatial self-attention.
     """
-    Basic ConvLSTM cell.
-    """
-    def __init__(self, input_dim, hidden_dim, kernel_size, bias=True):
-        """
-        Initialize ConvLSTM cell.
-        
-        Parameters:
-        ----------
-        input_dim: int
-            Number of channels of input tensor.
-        hidden_dim: int
-            Number of channels of hidden state.
-        kernel_size: int
-            Size of the convolutional kernel.
-        bias: bool
-            Whether to add bias or not.
-        """
+    def __init__(self, input_dim, hidden_dim, kernel_size):
         super(ConvLSTMCell, self).__init__()
         
         self.input_dim = input_dim
@@ -117,6 +133,9 @@ class ConvLSTMCell(nn.Module):
             padding=self.padding,
             bias=self.bias
         )
+
+        # 🔹 Add Standard Self-Attention Module
+        self.self_attention = SelfAttentionModule(hidden_dim)
         
     def forward(self, input_tensor, cur_state):
         """
@@ -134,7 +153,10 @@ class ConvLSTMCell(nn.Module):
         h_next, c_next: next hidden and cell states
         """
         h_cur, c_cur = cur_state
-        
+
+        # Apply self-attention to the hidden state BEFORE updating
+        h_cur = self.self_attention(h_cur)  # 🔹 Self-attention applied here
+
         # Concatenate along channel axis
         combined = torch.cat([input_tensor, h_cur], dim=1)
         
@@ -158,7 +180,7 @@ class ConvLSTMCell(nn.Module):
 
 class ConvLSTM(nn.Module):
     """
-    ConvLSTM module for sequence prediction.
+    ConvLSTM module with self-attention.
     """
     def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, batch_first=True, bias=True):
         """
@@ -324,26 +346,60 @@ class Predictor(nn.Module):
 def train(model, train_loader, criterion, optimizer, device, epoch):
     model.train()
     train_loss = 0
+    total_batches = len(train_loader)
+
+    # Track total time for the epoch
+    start_epoch = torch.cuda.Event(enable_timing=True)
+    end_epoch = torch.cuda.Event(enable_timing=True)
+    start_epoch.record()
+
+    # Compute scheduled samplingprobabiility (exponential decay)
+    teacher_forcing_prob = max(0.8 * math.exp(-epoch / 10), 0.1)
     for batch_idx, (input_seq, future_seq) in enumerate(train_loader):
         input_seq, future_seq = input_seq.to(device), future_seq.to(device)
-
+        #Measure time per iteration
+        start_iter = torch.cuda.Event(enable_timing=True)
+        end_iter = torch.cuda.Event(enable_timing=True)
+        start_iter.record()
         optimizer.zero_grad()
         output = model(input_seq)
+        batch_size, seq_len, _, height, width = future_seq.size()
+        new_input_seq = input_seq.clone()
+
+        for t in range(seq_len):
+            use_teacher_forcing = torch.rand(1).item() < teacher_forcing_prob
+
+            if use_teacher_forcing:
+                next_input = future_seq[:, t] # Teacher forcing or ground truth
+            else:
+                next_input = output[:, t].detach() # Predictions
 
         loss = criterion(output, future_seq)
         loss.backward()
         optimizer.step()
+        end_iter.record()
+        torch.cuda.synchronize()
+        iteration_time = start_iter.elapsed_time(end_iter)/1000
 
         train_loss += loss.item()
         
-        # Log batch loss to WandB
-        wandb.log({"Batch Loss": loss.item()})
+        # Log time to WandB
+        wandb.log({"Batch Loss": loss.item(), "Iteration Time (s)": iteration_time, "Teacher Forcing Prob": teacher_forcing_prob})
+        
+        if batch_idx % 100 == 0:  # Print every 100 batches
+            print(f"Epoch {epoch}, Batch {batch_idx}, Time per Iteration: {iteration_time:.4f}s, teacher_forcing_prob: {teacher_forcing_prob:.4f}")
+
+    end_epoch.record()
+    torch.cuda.synchronize()
+
+    epoch_time = start_epoch.elapsed_time(end_epoch)/1000
+    avg_iteration_time = epoch_time / total_batches
             
     avg_train_loss = train_loss / len(train_loader)
-    print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, avg_train_loss))
+    print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, avg_train_loss),  )
     
     # Log epoch train loss to WandB
-    wandb.log({"Epoch Train Loss": avg_train_loss, "Epoch": epoch})
+    wandb.log({"Epoch Train Loss": avg_train_loss, "Epoch": epoch, "Avg Iteration Time (s)": avg_iteration_time})
     
     return avg_train_loss
 
@@ -409,8 +465,17 @@ def visualize_prediction(model, test_loader, device, sample_idx=0):
     
     # Log the visualization to WandB
     wandb.log({"Predictions": wandb.Image('mnist_prediction.png')})
+def count_parameters(model):
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Trainable Parameters: {total_params:,}")  # Format with commas
+    
+    # 🔹 Log to WandB
+    wandb.log({"Total Parameters": total_params})
+    
+    return total_params
     
 def main():
+    torch.cuda.empty_cache()
     torch.manual_seed(42)
     random.seed(42)
     np.random.seed(42)
@@ -430,6 +495,10 @@ def main():
     
     # Create model
     model = Predictor(input_dim=input_dim, hidden_dim=hidden_dim, kernel_size=kernel_size, num_layers=num_layers).to(device)
+    print(f"Model is running with {model.saconvlstm.num_layers} layers.")
+
+    # Count trainable parameters
+    total_params = count_parameters(model)
     
     # Log model architecture to WandB
     wandb.watch(model)

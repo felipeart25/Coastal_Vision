@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -19,8 +21,8 @@ wandb.init(project="convlstm-mnist",
     "hidden_dim": 64,
     "kernel_size": (3, 3),
     "num_layers": 2,
-    "batch_size": 8,
-    "epochs": 3,
+    "batch_size": 4,
+    "epochs": 10,
     "learning_rate": 0.001,
     "optimizer": "Adam",
     "loss_function": "MSELoss"
@@ -83,63 +85,109 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# New SAM module that replicates the article’s self-attention memory module
 class SAM(nn.Module):
-    """Self-Attention Memory Module"""
     def __init__(self, in_channels):
         super().__init__()
-        self.query = nn.Conv2d(in_channels, in_channels//8, 1)
-        self.key = nn.Conv2d(in_channels, in_channels//8, 1)
-        self.value = nn.Conv2d(in_channels, in_channels, 1)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        # For current input features
+        self.conv_query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.conv_key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.conv_value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        
+        # For memory branch (mapping previous memory M_{t-1})
+        self.conv_mem_key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.conv_mem_value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        
+        # Fusion: fuse [Zh; Zm] -> aggregated feature Z via a 1x1 conv
+        self.conv_z = nn.Conv2d(in_channels * 2, in_channels, kernel_size=1)
+        
+        # Memory update gating with depth-wise separable convolutions.
+        # (In the paper, the gating is computed as: 
+        #   i'_t = sigmoid(W_mzi*Z + W_mhi*Ht + b_i),
+        #   g'_t = tanh(W_mzg*Z + W_mhg*Ht + b_g),
+        #   M_t = (1 - i'_t) ∘ M_{t-1} + i'_t ∘ g'_t,
+        #   o'_t = sigmoid(W_mzo*Z + W_mho*Ht + b_o),
+        #   Ĥ_t = o'_t ∘ M_t.)
+        #
+        # We approximate this using depth-wise (grouped) 3x3 convs.
+        self.conv_i = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        self.conv_hi = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        
+        self.conv_g = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        self.conv_hg = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        
+        self.conv_o = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        self.conv_ho = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
         
     def forward(self, x, prev_memory):
-        batch_size, _, height, width = x.size()
-        
-        # Query, Key, Value projections
-        q = self.query(x).view(batch_size, -1, height*width).permute(0, 2, 1)  # [B, N, C']
-        k = self.key(x).view(batch_size, -1, height*width)  # [B, C', N]
-        v = self.value(x).view(batch_size, -1, height*width)  # [B, C, N]
-        
-        # Memory integration
-        if prev_memory is not None:
-            k_m = self.key(prev_memory).view(batch_size, -1, height*width)
-            v_m = self.value(prev_memory).view(batch_size, -1, height*width)
-            k = torch.cat([k, k_m], dim=2)
-            v = torch.cat([v, v_m], dim=2)
-        
-        # Attention weights
-        attention = torch.bmm(q, k)  # [B, N, N]
-        attention = F.softmax(attention, dim=-1)
-        
-        # Attend to values
-        out = torch.bmm(v, attention.permute(0, 2, 1))
-        out = out.view(batch_size, -1, height, width)
-        
-        # Update memory
-        new_memory = self.gamma * out + x
-        
-        return out + x, new_memory  # Residual connection
+        # x: current hidden state Ht (B, C, H, W)
+        B, C, H, W = x.size()
+        N = H * W
 
+        # ---- Current branch (compute Zh) ----
+        query = self.conv_query(x).view(B, C // 8, N)       # (B, C//8, N)
+        key_current = self.conv_key(x).view(B, C // 8, N)       # (B, C//8, N)
+        value_current = self.conv_value(x).view(B, C, N)        # (B, C, N)
+        
+        # Compute pairwise similarity (current branch)
+        e_current = torch.bmm(query.transpose(1, 2), key_current)  # (B, N, N)
+        attn_current = F.softmax(e_current, dim=-1)
+        Zh = torch.bmm(value_current, attn_current.transpose(1, 2)).view(B, C, H, W)
+        
+        # ---- Memory branch (compute Zm) ----
+        if prev_memory is None:
+            # If no previous memory, set Zm to zeros (or you could use x)
+            Zm = torch.zeros_like(x)
+        else:
+            key_mem = self.conv_mem_key(prev_memory).view(B, C // 8, N)
+            value_mem = self.conv_mem_value(prev_memory).view(B, C, N)
+            e_mem = torch.bmm(query.transpose(1, 2), key_mem)  # (B, N, N)
+            attn_mem = F.softmax(e_mem, dim=-1)
+            Zm = torch.bmm(value_mem, attn_mem.transpose(1, 2)).view(B, C, H, W)
+        
+        # ---- Fuse aggregated features ----
+        Z_cat = torch.cat([Zh, Zm], dim=1)  # (B, 2C, H, W)
+        Z = self.conv_z(Z_cat)             # (B, C, H, W)
+        
+        # ---- Memory update ----
+        # Input gate (i'_t)
+        i_t = torch.sigmoid(self.conv_i(Z) + self.conv_hi(x))
+        # Candidate update (g'_t)
+        g_t = torch.tanh(self.conv_g(Z) + self.conv_hg(x))
+        if prev_memory is None:
+            prev_memory = torch.zeros_like(x)
+        M_new = (1 - i_t) * prev_memory + i_t * g_t
+        
+        # Output gate (o'_t)
+        o_t = torch.sigmoid(self.conv_o(Z) + self.conv_ho(x))
+        H_hat = o_t * M_new  # Final output
+        
+        return H_hat, M_new
+
+# SA-ConvLSTM Cell that embeds the new SAM module
 class SAConvLSTMCell(nn.Module):
-    """Self-Attention ConvLSTM Cell"""
+    """Self-Attention ConvLSTM Cell with updated SAM module"""
     def __init__(self, input_dim, hidden_dim, kernel_size):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        padding = kernel_size[0] // 2, kernel_size[1] // 2
+        padding = (kernel_size // 2, kernel_size // 2) if isinstance(kernel_size, int) else (kernel_size[0] // 2, kernel_size[1] // 2)
+
         
+        # Standard ConvLSTM operations: compute gates from input and previous hidden state
         self.conv = nn.Conv2d(
             in_channels=input_dim + hidden_dim,
             out_channels=4 * hidden_dim,
             kernel_size=kernel_size,
             padding=padding
         )
+        # Use the revised SAM for self-attention memory update
         self.sam = SAM(hidden_dim)
         
     def forward(self, x, prev_state):
         h_prev, c_prev, m_prev = prev_state
         
-        # ConvLSTM operations
+        # Concatenate input and previous hidden state and apply convolution
         combined = torch.cat([x, h_prev], dim=1)
         combined_conv = self.conv(combined)
         cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
@@ -149,38 +197,36 @@ class SAConvLSTMCell(nn.Module):
         o = torch.sigmoid(cc_o)
         g = torch.tanh(cc_g)
         
+        # Update cell state
         c_cur = f * c_prev + i * g
         h_cur = o * torch.tanh(c_cur)
         
-        # Self-attention memory
+        # Apply the SAM to h_cur (and previous memory) to get self-attended hidden state and new memory
         h_attn, m_cur = self.sam(h_cur, m_prev)
         
-        # Store h_attn in the state instead of h_cur
-        return h_attn, (h_attn, c_cur, m_cur)  # Changed h_cur to h_attn
+        return h_attn, (h_attn, c_cur, m_cur)
 
+# A simple SA-ConvLSTM module that stacks multiple cells
 class SimpleSAConvLSTM(nn.Module):
-    """Simplified SA-ConvLSTM without separate encoder and decoder"""
+    """Simplified SA-ConvLSTM with stacked SAConvLSTMCells"""
     def __init__(self, input_dim=1, hidden_dim=64, num_layers=4, kernel_size=3):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        # Create stack of SAConvLSTM cells
+        # Create a stack of SAConvLSTM cells
         self.cells = nn.ModuleList()
         for i in range(num_layers):
-            if i == 0:
-                cell_input_dim = input_dim
-            else:
-                cell_input_dim = hidden_dim
-                
+            cell_input_dim = input_dim if i == 0 else hidden_dim
             self.cells.append(SAConvLSTMCell(cell_input_dim, hidden_dim, kernel_size))
+
         
-        # Output layer
+        # Output layer: map hidden state back to input dimension
         self.conv_out = nn.Conv2d(hidden_dim, input_dim, kernel_size=1)
         
     def init_hidden(self, batch_size, height, width, device):
-        """Initialize hidden states for all layers"""
+        """Initialize hidden, cell and memory states for all layers"""
         hidden = []
         for _ in range(self.num_layers):
             h = torch.zeros(batch_size, self.hidden_dim, height, width, device=device)
@@ -191,14 +237,13 @@ class SimpleSAConvLSTM(nn.Module):
     
     def forward(self, x, future_seq=10):
         """
-        x: input tensor of shape [batch_size, seq_len, channels, height, width]
-        future_seq: number of future frames to predict
+        x: Input tensor with shape (batch_size, seq_len, channels, height, width)
+        future_seq: Number of future frames to predict
         """
-        # Get tensor dimensions
         batch_size, seq_len, _, height, width = x.size()
         device = x.device
         
-        # Initialize hidden states for all layers
+        # Initialize hidden states for each layer
         hidden = self.init_hidden(batch_size, height, width, device)
         
         # Process input sequence
@@ -206,39 +251,33 @@ class SimpleSAConvLSTM(nn.Module):
             input_tensor = x[:, t]
             for layer_idx, cell in enumerate(self.cells):
                 if layer_idx == 0:
-                    # First layer takes the input directly
                     h, hidden[layer_idx] = cell(input_tensor, hidden[layer_idx])
                 else:
-                    # Higher layers take output from previous layer
                     h, hidden[layer_idx] = cell(h, hidden[layer_idx])
         
-        # Generate future predictions
+        # Generate future predictions autoregressively
         outputs = []
         for _ in range(future_seq):
             for layer_idx, cell in enumerate(self.cells):
                 if layer_idx == 0:
+                    # For the first layer, use the last prediction (or the output from the input sequence)
                     if len(outputs) == 0:
-                        # Use the last layer's output (h_attn) from input processing
-                        last_output = hidden[-1][0]  # Now h_attn is stored in the state
-                        first_pred = self.conv_out(last_output)
-                        h, hidden[layer_idx] = cell(first_pred, hidden[layer_idx])
+                        pred_input = self.conv_out(hidden[-1][0])
                     else:
-                        h, hidden[layer_idx] = cell(outputs[-1][:, 0], hidden[layer_idx])
+                        pred_input = outputs[-1][:, 0]
+                    h, hidden[layer_idx] = cell(pred_input, hidden[layer_idx])
                 else:
                     h, hidden[layer_idx] = cell(h, hidden[layer_idx])
-            # Generate prediction from the last layer's output (h_attn)
             pred = self.conv_out(hidden[-1][0])
             outputs.append(pred.unsqueeze(1))
         
-        # Concatenate all predictions along time dimension
         outputs = torch.cat(outputs, dim=1)
         return outputs
 
-
+# Predictor model that wraps the SA-ConvLSTM
 class Predictor(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size, num_layers):
-        super(Predictor, self).__init__()
-        # Use the new SAConvLSTM implementation
+        super().__init__()
         self.saconvlstm = SimpleSAConvLSTM(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -247,29 +286,52 @@ class Predictor(nn.Module):
         )
     
     def forward(self, x, future_seq=10):
-        # Directly return predictions from SAConvLSTM
         return self.saconvlstm(x, future_seq=future_seq)
     
 def train(model, train_loader, criterion, optimizer, device, epoch):
     model.train()
     train_loss = 0
+    total_batches = len(train_loader)
+
+    # Track total time for the epoch
+    start_epoch = torch.cuda.Event(enable_timing=True)
+    end_epoch = torch.cuda.Event(enable_timing=True)
+    start_epoch.record()
+
     for batch_idx, (input_seq, future_seq) in enumerate(train_loader):
         input_seq, future_seq = input_seq.to(device), future_seq.to(device)
 
+        #Measure time per iteration
+        start_iter = torch.cuda.Event(enable_timing=True)
+        end_iter = torch.cuda.Event(enable_timing=True)
+        start_iter.record()
+
         optimizer.zero_grad()
         output = model(input_seq)
-        #print(future_seq.shape, output.shape )
         loss = criterion(output, future_seq)
         loss.backward()
         optimizer.step()
 
+        end_iter.record()
+        torch.cuda.synchronize()
+        iteration_time = start_iter.elapsed_time(end_iter)/1000
+
         train_loss += loss.item()
         
-        # Log batch loss to WandB
-        wandb.log({"Batch Loss": loss.item()})
+        # Log time to WandB
+        wandb.log({"Batch Loss": loss.item(), "Iteration Time (s)": iteration_time})
+        
+        if batch_idx % 100 == 0:  # Print every 100 batches
+            print(f"Epoch {epoch}, Batch {batch_idx}, Time per Iteration: {iteration_time:.4f}s")
+
+    end_epoch.record()
+    torch.cuda.synchronize()
+
+    epoch_time = start_epoch.elapsed_time(end_epoch)/1000
+    avg_iteration_time = epoch_time / total_batches
             
     avg_train_loss = train_loss / len(train_loader)
-    print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, avg_train_loss))
+    print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, avg_train_loss), )
     
     # Log epoch train loss to WandB
     wandb.log({"Epoch Train Loss": avg_train_loss, "Epoch": epoch})
@@ -340,6 +402,7 @@ def visualize_prediction(model, test_loader, device, sample_idx=0):
     wandb.log({"Predictions": wandb.Image('mnist_prediction.png')})
     
 def main():
+    torch.cuda.empty_cache()
     torch.manual_seed(42)
     random.seed(42)
     np.random.seed(42)

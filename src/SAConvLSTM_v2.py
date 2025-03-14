@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.checkpoint import checkpoint
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -20,7 +21,7 @@ wandb.init(project="convlstm-mnist",
     "kernel_size": (3, 3),
     "num_layers": 2,
     "batch_size": 8,
-    "epochs": 3,
+    "epochs": 10,
     "learning_rate": 0.001,
     "optimizer": "Adam",
     "loss_function": "MSELoss"
@@ -87,38 +88,52 @@ class SAM(nn.Module):
     """Self-Attention Memory Module"""
     def __init__(self, in_channels):
         super().__init__()
-        self.query = nn.Conv2d(in_channels, in_channels//8, 1)
-        self.key = nn.Conv2d(in_channels, in_channels//8, 1)
+        reduction_factor = 16  # Changed from 8 to 16
+        self.query = nn.Conv2d(in_channels, in_channels//reduction_factor, 1)
+        self.key = nn.Conv2d(in_channels, in_channels//reduction_factor, 1)
         self.value = nn.Conv2d(in_channels, in_channels, 1)
         self.gamma = nn.Parameter(torch.zeros(1))
         
     def forward(self, x, prev_memory):
-        batch_size, _, height, width = x.size()
+        batch_size, channels, height, width = x.size()
         
-        # Query, Key, Value projections
-        q = self.query(x).view(batch_size, -1, height*width).permute(0, 2, 1)  # [B, N, C']
-        k = self.key(x).view(batch_size, -1, height*width)  # [B, C', N]
-        v = self.value(x).view(batch_size, -1, height*width)  # [B, C, N]
+        # Skip memory integration when unnecessary
+        if prev_memory is None or torch.allclose(prev_memory, torch.zeros_like(prev_memory)):
+            # Simplified attention when no memory is available
+            q = self.query(x).view(batch_size, -1, height*width).permute(0, 2, 1)
+            k = self.key(x).view(batch_size, -1, height*width)
+            v = self.value(x).view(batch_size, -1, height*width)
+            
+            # Scale attention to prevent gradient issues
+            attention = torch.bmm(q, k) / (channels ** 0.5)
+            attention = F.softmax(attention, dim=-1)
+            
+            out = torch.bmm(v, attention.permute(0, 2, 1))
+            out = out.view(batch_size, -1, height, width)
+            
+            new_memory = self.gamma * out + x
+            return out + x, new_memory
+            
+        # Memory is available, use original implementation
+        q = self.query(x).view(batch_size, -1, height*width).permute(0, 2, 1)
+        k = self.key(x).view(batch_size, -1, height*width)
+        v = self.value(x).view(batch_size, -1, height*width)
         
-        # Memory integration
-        if prev_memory is not None:
-            k_m = self.key(prev_memory).view(batch_size, -1, height*width)
-            v_m = self.value(prev_memory).view(batch_size, -1, height*width)
-            k = torch.cat([k, k_m], dim=2)
-            v = torch.cat([v, v_m], dim=2)
+        k_m = self.key(prev_memory).view(batch_size, -1, height*width)
+        v_m = self.value(prev_memory).view(batch_size, -1, height*width)
         
-        # Attention weights
-        attention = torch.bmm(q, k)  # [B, N, N]
+        # Attention scaling for numerical stability
+        k = torch.cat([k, k_m], dim=2)
+        v = torch.cat([v, v_m], dim=2)
+        
+        attention = torch.bmm(q, k) / (channels ** 0.5)  # Scale by sqrt(channels)
         attention = F.softmax(attention, dim=-1)
         
-        # Attend to values
         out = torch.bmm(v, attention.permute(0, 2, 1))
         out = out.view(batch_size, -1, height, width)
         
-        # Update memory
         new_memory = self.gamma * out + x
-        
-        return out + x, new_memory  # Residual connection
+        return out + x, new_memory
 
 class SAConvLSTMCell(nn.Module):
     """Self-Attention ConvLSTM Cell"""
@@ -191,8 +206,7 @@ class SimpleSAConvLSTM(nn.Module):
     
     def forward(self, x, future_seq=10):
         """
-        x: input tensor of shape [batch_size, seq_len, channels, height, width]
-        future_seq: number of future frames to predict
+        Optimized forward pass with reduced sequential operations
         """
         # Get tensor dimensions
         batch_size, seq_len, _, height, width = x.size()
@@ -201,38 +215,35 @@ class SimpleSAConvLSTM(nn.Module):
         # Initialize hidden states for all layers
         hidden = self.init_hidden(batch_size, height, width, device)
         
-        # Process input sequence
-        for t in range(seq_len):
-            input_tensor = x[:, t]
-            for layer_idx, cell in enumerate(self.cells):
-                if layer_idx == 0:
-                    # First layer takes the input directly
-                    h, hidden[layer_idx] = cell(input_tensor, hidden[layer_idx])
-                else:
-                    # Higher layers take output from previous layer
-                    h, hidden[layer_idx] = cell(h, hidden[layer_idx])
+        # Process input sequence - try to parallelize when possible
+        input_frames = [x[:, t] for t in range(seq_len)]
         
-        # Generate future predictions
-        outputs = []
-        for _ in range(future_seq):
+        # Process each timestep
+        for t in range(seq_len):
+            h = input_frames[t]
+            # Process through layers sequentially
             for layer_idx, cell in enumerate(self.cells):
-                if layer_idx == 0:
-                    if len(outputs) == 0:
-                        # Use the last layer's output (h_attn) from input processing
-                        last_output = hidden[-1][0]  # Now h_attn is stored in the state
-                        first_pred = self.conv_out(last_output)
-                        h, hidden[layer_idx] = cell(first_pred, hidden[layer_idx])
-                    else:
-                        h, hidden[layer_idx] = cell(outputs[-1][:, 0], hidden[layer_idx])
-                else:
-                    h, hidden[layer_idx] = cell(h, hidden[layer_idx])
-            # Generate prediction from the last layer's output (h_attn)
-            pred = self.conv_out(hidden[-1][0])
+                h, hidden[layer_idx] = cell(h, hidden[layer_idx])
+        
+        # Generate future predictions more efficiently
+        outputs = []
+        h = hidden[-1][0]  # Start with the final hidden state
+        pred = self.conv_out(h)
+        outputs.append(pred.unsqueeze(1))
+        
+        # Generate remaining predictions
+        for _ in range(1, future_seq):
+            h = outputs[-1][:, 0]  # Last prediction
+            
+            # Reuse the for loop to avoid code duplication
+            for layer_idx, cell in enumerate(self.cells):
+                h, hidden[layer_idx] = cell(h, hidden[layer_idx])
+                
+            pred = self.conv_out(h)
             outputs.append(pred.unsqueeze(1))
         
-        # Concatenate all predictions along time dimension
-        outputs = torch.cat(outputs, dim=1)
-        return outputs
+        # Concatenate all predictions at once (more efficient)
+        return torch.cat(outputs, dim=1)
 
 
 class Predictor(nn.Module):
