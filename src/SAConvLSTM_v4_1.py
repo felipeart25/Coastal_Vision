@@ -21,7 +21,7 @@ wandb.init(project="convlstm-mnist",
     "input_dim": 1,
     "hidden_dim": 64,
     "kernel_size": (3, 3),
-    "num_layers": 2,
+    "num_layers": 1,
     "batch_size": 4,
     "epochs": 5,
     "learning_rate": 0.001,
@@ -294,76 +294,79 @@ def train(model, train_loader, criterion, optimizer, device, epoch):
     train_loss = 0
     total_batches = len(train_loader)
 
-    # Track total time for the epoch
     start_epoch = torch.cuda.Event(enable_timing=True)
     end_epoch = torch.cuda.Event(enable_timing=True)
     start_epoch.record()
 
     # Compute scheduled sampling probability (exponential decay)
-    teacher_forcing_prob = max(0.7 * math.exp(-epoch / 10), 0.1)
+    teacher_forcing_prob = max(0.8 * math.exp(-epoch / 10), 0.1)
 
     for batch_idx, (input_seq, future_seq) in enumerate(train_loader):
         input_seq, future_seq = input_seq.to(device), future_seq.to(device)
 
-        # Measure time per iteration
         start_iter = torch.cuda.Event(enable_timing=True)
         end_iter = torch.cuda.Event(enable_timing=True)
         start_iter.record()
 
         optimizer.zero_grad()
 
-        # Initialize new input sequence (copy of input)
-        new_input_seq = input_seq.clone()
+        # Get dimensions
+        batch_size, seq_len, _, height, width = future_seq.size()
 
-        # List to store predictions for all future frames
-        predictions = []
+        # Initialize the first input with the last frame of the input sequence
+        current_input = input_seq[:, -1, :, :, :]
+        outputs = []
 
-        for t in range(future_seq.shape[1]):  # Iterate over future time steps (10 frames)
-            # Forward pass: Predict one frame ahead
-            output = model(new_input_seq)  # Shape: (batch_size, seq_len, 1, H, W)
+        # Generate each frame step-by-step
+        for t in range(seq_len):
+            # Forward step: Pass only the current input frame
+            output = model.saconvlstm(current_input.unsqueeze(1))  # Shape: (B, 1, C, H, W)
+            next_frame = output[:, 0]  # Extract the predicted frame
+            outputs.append(next_frame.unsqueeze(1))  # Add time dimension
 
-            # Take only the last predicted frame (timestep -1)
-            pred_frame = output[:, -1]  # Shape: (batch_size, 1, H, W)
-            predictions.append(pred_frame.unsqueeze(1))  # Store prediction
-
-            # Decide whether to use teacher forcing
+            # Decide to use teacher forcing or not
             use_teacher_forcing = torch.rand(1).item() < teacher_forcing_prob
-            next_input = future_seq[:, t] if use_teacher_forcing else pred_frame.detach()
+            if use_teacher_forcing:
+                current_input = future_seq[:, t]
+            else:
+                current_input = next_frame.detach()  # Detach to avoid backprop through time
 
-            # Shift new_input_seq forward and append next input
-            new_input_seq = torch.cat([new_input_seq[:, 1:], next_input.unsqueeze(1)], dim=1)
-
-        # Convert list of predictions to tensor (batch_size, future_steps, 1, H, W)
-        predictions = torch.cat(predictions, dim=1)
+        # Combine all predicted frames
+        output = torch.cat(outputs, dim=1)
 
         # Compute loss
-        loss = criterion(predictions, future_seq)
+        loss = criterion(output, future_seq)
         loss.backward()
         optimizer.step()
 
         end_iter.record()
         torch.cuda.synchronize()
-        iteration_time = start_iter.elapsed_time(end_iter) / 1000  # Convert ms to seconds
+        iteration_time = start_iter.elapsed_time(end_iter) / 1000
 
         train_loss += loss.item()
 
-        # Log time and loss to WandB
-        wandb.log({"Batch Loss": loss.item(), "Iteration Time (s)": iteration_time, "Teacher Forcing Prob": teacher_forcing_prob})
+        wandb.log({
+            "Batch Loss": loss.item(),
+            "Iteration Time (s)": iteration_time,
+            "Teacher Forcing Prob": teacher_forcing_prob
+        })
 
         if batch_idx % 100 == 0:
-            print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, Iteration Time: {iteration_time:.4f}s, Teacher Forcing Prob: {teacher_forcing_prob:.4f}")
+            print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, Time: {iteration_time:.4f}s")
 
     end_epoch.record()
     torch.cuda.synchronize()
-
-    epoch_time = start_epoch.elapsed_time(end_epoch) / 1000  # Convert ms to seconds
+    epoch_time = start_epoch.elapsed_time(end_epoch) / 1000
     avg_iteration_time = epoch_time / total_batches
 
     avg_train_loss = train_loss / len(train_loader)
-    print(f"====> Epoch: {epoch}, Average Loss: {avg_train_loss:.4f}")
+    print(f'====> Epoch: {epoch}, Average Loss: {avg_train_loss:.4f}')
 
-    # Log epoch train loss to WandB
-    wandb.log({"Epoch Train Loss": avg_train_loss, "Epoch": epoch, "Avg Iteration Time (s)": avg_iteration_time})
+    wandb.log({
+        "Epoch Train Loss": avg_train_loss,
+        "Epoch": epoch,
+        "Avg Iteration Time (s)": avg_iteration_time
+    })
 
     return avg_train_loss
 
@@ -371,64 +374,101 @@ def train(model, train_loader, criterion, optimizer, device, epoch):
 def validate(model, val_loader, criterion, device, epoch):
     model.eval()
     val_loss = 0
-    
+
     with torch.no_grad():
         for input_seq, target_seq in val_loader:
             input_seq, target_seq = input_seq.to(device), target_seq.to(device)
-            
-            output = model(input_seq)
+
+            # Initialize the first input with the last frame of the input sequence
+            current_input = input_seq[:, -1, :, :, :]
+            outputs = []
+
+            # Generate each frame step-by-step
+            for t in range(target_seq.size(1)):
+                # Forward step: Pass only the current input frame
+                output = model.saconvlstm(current_input.unsqueeze(1))  # Shape: (B, 1, C, H, W)
+                next_frame = output[:, 0]  # Extract the predicted frame
+                outputs.append(next_frame.unsqueeze(1))  # Add time dimension
+
+                # Use prediction as next input
+                current_input = next_frame
+
+            # Combine all predicted frames
+            output = torch.cat(outputs, dim=1)
+
+            # Compute loss
             loss = criterion(output, target_seq)
-            
             val_loss += loss.item()
-    
+
     avg_val_loss = val_loss / len(val_loader)
-    
-    # Log epoch validation loss to WandB
     wandb.log({"Epoch Validation Loss": avg_val_loss, "Epoch": epoch})
-    
+
     return avg_val_loss
 
 def visualize_prediction(model, test_loader, device, sample_idx=0):
     model.eval()
-    
+
     # Get a sample from the test set
     for i, (input_seq, target_seq) in enumerate(test_loader):
         if i == sample_idx:
             break
-    
-    input_seq = input_seq.to(device)
-    target_seq = target_seq.to(device)
-    
+
+    input_seq, target_seq = input_seq.to(device), target_seq.to(device)
+
     with torch.no_grad():
-        output = model(input_seq)
-    
+        # Initialize the first input with the last frame of the input sequence
+        current_input = input_seq[:, -1, :, :, :]
+        outputs = []
+
+        # Generate each frame step-by-step
+        for t in range(target_seq.size(1)):
+            # Forward step: Pass only the current input frame
+            output = model.saconvlstm(current_input.unsqueeze(1))  # Shape: (B, 1, C, H, W)
+            next_frame = output[:, 0]  # Extract the predicted frame
+            outputs.append(next_frame.unsqueeze(1))  # Add time dimension
+
+            # Use prediction as next input
+            current_input = next_frame
+
+        # Combine all predicted frames
+        output = torch.cat(outputs, dim=1)
+
     # Plot
     fig, axes = plt.subplots(3, 10, figsize=(20, 6))
-    
+
     # Input sequence
     for t in range(10):
         axes[0, t].imshow(input_seq[0, t, 0].cpu().numpy(), cmap='gray')
         axes[0, t].set_title(f'Input t={t}')
         axes[0, t].axis('off')
-    
+
     # Target sequence
     for t in range(10):
         axes[1, t].imshow(target_seq[0, t, 0].cpu().numpy(), cmap='gray')
         axes[1, t].set_title(f'Target t={t+10}')
         axes[1, t].axis('off')
-    
+
     # Predicted sequence
     for t in range(10):
         axes[2, t].imshow(output[0, t, 0].cpu().numpy(), cmap='gray')
         axes[2, t].set_title(f'Pred t={t+10}')
         axes[2, t].axis('off')
-    
+
     plt.tight_layout()
     plt.savefig('mnist_prediction.png')
     plt.close()
-    
+
     # Log the visualization to WandB
     wandb.log({"Predictions": wandb.Image('mnist_prediction.png')})
+
+def count_parameters(model):
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Trainable Parameters: {total_params:,}")  # Format with commas
+    
+    # 🔹 Log to WandB
+    wandb.log({"Total Parameters": total_params})
+    
+    return total_params
     
 def main():
     torch.cuda.empty_cache()
@@ -451,6 +491,11 @@ def main():
     
     # Create model
     model = Predictor(input_dim=input_dim, hidden_dim=hidden_dim, kernel_size=kernel_size, num_layers=num_layers).to(device)
+
+    print(f"Model is running with {model.saconvlstm.num_layers} layers.")
+
+    # Count trainable parameters
+    total_params = count_parameters(model)
     
     # Log model architecture to WandB
     wandb.watch(model)
