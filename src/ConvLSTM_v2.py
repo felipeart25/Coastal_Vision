@@ -21,9 +21,9 @@ wandb.init(project="convlstm-mnist",
     "input_dim": 1,
     "hidden_dim": 64,
     "kernel_size": (3, 3),
-    "num_layers": 2,
-    "batch_size": 4,
-    "epochs": 10,
+    "num_layers": 4,
+    "batch_size": 16,
+    "epochs": 80,
     "learning_rate": 0.001,
     "optimizer": "Adam",
     "loss_function": "MSELoss"
@@ -327,62 +327,87 @@ def train(model, train_loader, criterion, optimizer, device, epoch):
     train_loss = 0
     total_batches = len(train_loader)
 
-    # Track total time for the epoch
     start_epoch = torch.cuda.Event(enable_timing=True)
     end_epoch = torch.cuda.Event(enable_timing=True)
     start_epoch.record()
 
-    # Compute scheduled samplingprobabiility (exponential decay)
-    teacher_forcing_prob = max(0.8 * math.exp(-epoch / 10), 0.1)
+    if epoch < 40:
+        teacher_forcing_prob = 1.0  # Pure teacher forcing early on
+    else:
+        teacher_forcing_prob = max(0.9 * math.exp(-((epoch - 40) / 40)), 0.2)  # Slower decay 
+    
     for batch_idx, (input_seq, future_seq) in enumerate(train_loader):
         input_seq, future_seq = input_seq.to(device), future_seq.to(device)
-        #Measure time per iteration
+        
         start_iter = torch.cuda.Event(enable_timing=True)
         end_iter = torch.cuda.Event(enable_timing=True)
         start_iter.record()
 
         optimizer.zero_grad()
-        
 
-        #batch_size, seq_len, _, height, width = future_seq.size()
-        
+        # Get dimensions
+        batch_size, seq_len, _, height, width = future_seq.size()
 
+        # Process input sequence to initialize hidden state
+        _, hidden_state = model.convlstm(input_seq)
+        
+        # Initialize the first input with the last frame of the input sequence
+        current_input = input_seq[:, -1, :, :, :]
+        outputs = []
+
+        # Generate each frame step-by-step
         for t in range(seq_len):
+            # Forward step with current input and hidden state
+            lstm_output, hidden_state = model.convlstm(
+                current_input.unsqueeze(1),  # Add time dimension
+                hidden_state
+            )
+            next_frame = model.conv_output(lstm_output[:, 0])
+            outputs.append(next_frame.unsqueeze(1))  # Add time dimension
+            
+            # Decide to use teacher forcing or not
             use_teacher_forcing = torch.rand(1).item() < teacher_forcing_prob
-
-            if t==0 or use_teacher_forcing:
-                next_input = future_seq[:, t] # Teacher forcing or ground truth
+            if use_teacher_forcing:
+                current_input = future_seq[:, t]
             else:
-                next_input = output[:, t].detach() # Predictions
+                current_input = next_frame.detach()  # Detach to avoid backprop through time
 
-        output = model(next_input)
-
+        # Combine all predicted frames
+        output = torch.cat(outputs, dim=1)
+        
+        # Compute loss
         loss = criterion(output, future_seq)
         loss.backward()
         optimizer.step()
+
         end_iter.record()
         torch.cuda.synchronize()
-        iteration_time = start_iter.elapsed_time(end_iter)/1000
+        iteration_time = start_iter.elapsed_time(end_iter) / 1000
 
         train_loss += loss.item()
         
-        # Log time to WandB
-        wandb.log({"Batch Loss": loss.item(), "Iteration Time (s)": iteration_time, "Teacher Forcing Prob": teacher_forcing_prob})
+        wandb.log({
+            "Batch Loss": loss.item(),
+            "Iteration Time (s)": iteration_time,
+            "Teacher Forcing Prob": teacher_forcing_prob
+        })
         
-        if batch_idx % 100 == 0:  # Print every 100 batches
-            print(f"Epoch {epoch}, Batch {batch_idx}, Time per Iteration: {iteration_time:.4f}s, teacher_forcing_prob: {teacher_forcing_prob:.4f}")
+        if batch_idx % 100 == 0:
+            print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}, Time: {iteration_time:.4f}s")
 
     end_epoch.record()
     torch.cuda.synchronize()
-
-    epoch_time = start_epoch.elapsed_time(end_epoch)/1000
+    epoch_time = start_epoch.elapsed_time(end_epoch) / 1000
     avg_iteration_time = epoch_time / total_batches
             
     avg_train_loss = train_loss / len(train_loader)
-    print('====> Epoch: {} Average loss: {:.4f}'.format(epoch, avg_train_loss),  )
+    print(f'Epoch {epoch} Average Train Loss: {avg_train_loss:.4f}')
     
-    # Log epoch train loss to WandB
-    wandb.log({"Epoch Train Loss": avg_train_loss, "Epoch": epoch, "Avg Iteration Time (s)": avg_iteration_time})
+    wandb.log({
+        "Epoch Train Loss": avg_train_loss,
+        "Epoch": epoch,
+        "Avg Iteration Time (s)": avg_iteration_time
+    })
     
     return avg_train_loss
 
@@ -395,14 +420,33 @@ def validate(model, val_loader, criterion, device, epoch):
         for input_seq, target_seq in val_loader:
             input_seq, target_seq = input_seq.to(device), target_seq.to(device)
             
-            output = model(input_seq)
-            loss = criterion(output, target_seq)
+            # Initialize hidden state with input sequence
+            _, hidden_state = model.convlstm(input_seq)
             
+            # Start with last frame of input sequence
+            current_input = input_seq[:, -1]
+            batch_size, seq_len, _, height, width = target_seq.size()
+            outputs = []
+            
+            # Generate predictions autoregressively
+            for t in range(seq_len):
+                # Forward step
+                lstm_output, hidden_state = model.convlstm(
+                    current_input.unsqueeze(1),  # Add time dimension
+                    hidden_state
+                )
+                next_frame = model.conv_output(lstm_output[:, 0])
+                outputs.append(next_frame.unsqueeze(1))
+                
+                # Use prediction as next input
+                current_input = next_frame
+            
+            # Combine predictions and compute loss
+            output = torch.cat(outputs, dim=1)
+            loss = criterion(output, target_seq)
             val_loss += loss.item()
     
     avg_val_loss = val_loss / len(val_loader)
-    
-    # Log epoch validation loss to WandB
     wandb.log({"Epoch Validation Loss": avg_val_loss, "Epoch": epoch})
     
     return avg_val_loss
