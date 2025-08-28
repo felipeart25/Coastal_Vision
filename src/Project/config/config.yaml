@@ -1,0 +1,15 @@
+# config.yaml
+architecture: 2 Layers
+input_dim: 1
+lstm_hidden_size: 64
+batch_size: 8
+epochs: 50
+learning_rate: 0.001
+optimizer: Adam
+loss_function: UnifiedFocalLoss
+dropout: 0.2
+future_seq: 10
+UFL_weight: 0.5
+UFL_delta: 0.7
+UFL_gamma: 0.75
+HDL_alpha: 0.5
